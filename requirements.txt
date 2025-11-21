@@ -1,0 +1,13 @@
+# Entorno y Simulación
+gymnasium
+traci
+sumolib
+
+# Inteligencia Artificial y RL
+stable-baselines3
+torch
+numpy
+shimmy
+
+# Visualización de métricas
+tensorboard
