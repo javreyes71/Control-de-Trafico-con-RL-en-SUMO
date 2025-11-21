@@ -1,0 +1,6 @@
+BASURA_OLD/
+__pycache__/
+models/
+tensorboard/
+results/
+*.log
