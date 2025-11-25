@@ -4,3 +4,10 @@ models/
 tensorboard/
 results/
 *.log
+venv/
+models/
+tensorboard/
+__pycache__/
+*.pyc
+.DS_Store
+*.log

@@ -1,72 +1,45 @@
-# train_rl.py
-import os
-import warnings
+import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from traffic_env_sumo import TrafficSumoEnv
+import os
 
-warnings.filterwarnings("ignore")
+# --- CREAR DIRECTORIOS ---
+models_dir = "models/ppo_multi_agent"
+log_dir = "tensorboard/multi_agent_logs"
 
-MODEL_DIR = "models"
-TB_DIR = "tensorboard"
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(TB_DIR, exist_ok=True)
+os.makedirs(models_dir, exist_ok=True)
+os.makedirs(log_dir, exist_ok=True)
 
-class SimpleLogCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super(SimpleLogCallback, self).__init__(verbose)
-        self.ep_count = 0
+# --- INICIAR ENTORNO ---
+# gui=False para entrenar rápido (sin ventana gráfica)
+print("🏗️  Creando entorno Multi-Agente Centralizado...")
+env = TrafficSumoEnv(gui=False) 
 
-    def _on_step(self) -> bool:
-        if self.locals.get("dones", [False])[0]:
-            self.ep_count += 1
-            info = self.locals.get("infos", [{}])[0]
-            
-            # Extracción de datos
-            rew = info.get("episode", {}).get("r", 0)
-            length = info.get("episode", {}).get("l", 0)
-            
-            # Extraer último número de vehiculos 
-            mins = (length * 2.0) / 60 
-            
-            print(f"--- Ep {self.ep_count} | Reward: {rew:.1f} | Duración: {mins:.1f} min ---")
-            if mins < 55:
-                print(f"    ⚠️ Episodio terminado por baja densidad (<10 autos).")
-                
-        return True
+# --- CONFIGURAR AGENTE PPO ---
+# Usamos MlpPolicy porque la entrada es un vector plano de números
+model = PPO(
+    "MlpPolicy", 
+    env, 
+    verbose=1, 
+    tensorboard_log=log_dir,
+    learning_rate=0.0003, # Tasa de aprendizaje estándar
+    n_steps=2048,         # Pasos antes de actualizar la red (mayor es mejor para entornos complejos)
+    batch_size=64,
+    gamma=0.99            # Factor de descuento (importancia del futuro)
+)
 
-def make_env():
-    env = TrafficSumoEnv(gui=False)
-    env.setup()
-    return Monitor(env)
+print("🚀 Iniciando entrenamiento...")
+print("El sistema aprenderá a coordinar TODOS los semáforos para minimizar colas y esperas.")
 
-if __name__ == "__main__":
-    print("🚀 Iniciando Entrenamiento Optimizado (SmartLock + Min 10 Autos)")
+# --- CICLO DE ENTRENAMIENTO ---
+TIMESTEPS = 10000
+for i in range(1, 51): # 50 iteraciones * 10,000 pasos = 500,000 pasos totales
+    model.learn(total_timesteps=TIMESTEPS, reset_num_timesteps=False, tb_log_name="PPO_City_Multi")
     
-    env = DummyVecEnv([make_env])
+    # Guardar checkpoint
+    save_path = f"{models_dir}/ppo_multi_{TIMESTEPS*i}"
+    model.save(save_path)
+    print(f"💾 Modelo guardado en: {save_path}")
 
-    model = PPO(
-        "MlpPolicy", env, verbose=1,
-        learning_rate=3e-4,
-        n_steps=2048, 
-        batch_size=64, 
-        gamma=0.99, 
-        ent_coef=0.01,
-        tensorboard_log=TB_DIR
-    )
-
-    TOTAL_TIMESTEPS = 300000
-    
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS, 
-        callback=[
-            CheckpointCallback(save_freq=10000, save_path=MODEL_DIR, name_prefix="ppo_smart"),
-            SimpleLogCallback()
-        ]
-    )
-    
-    model.save(os.path.join(MODEL_DIR, "ppo_final"))
-    env.close()
-    print("✅ Entrenamiento finalizado.")
+print("✅ Entrenamiento finalizado.")
+env.close()

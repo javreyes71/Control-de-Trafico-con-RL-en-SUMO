@@ -4,7 +4,7 @@ import os
 from stable_baselines3 import PPO
 from traffic_env_sumo import TrafficSumoEnv
 
-MODEL_PATH = "models/ppo_final"
+MODEL_PATH = "models/ppo_multi_agent/ppo_multi_250000"
 
 def main():
     if not os.path.exists(f"{MODEL_PATH}.zip"):

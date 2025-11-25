@@ -1,203 +1,203 @@
-# traffic_env_sumo.py
-import time
-import random
-import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import traci
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from traffic_generator import generate_routefile
-
-NETWORK_FILE = Path("network.net.xml")
-ROUTES_FILE = "routes.rou.xml"
-SUMO_CFG = "simulation.sumocfg"
+import sumolib
+import numpy as np
+import os
+import sys
 
 # --- CONFIGURACIÓN ---
-STEP_LENGTH = 0.4       
-DELTA_TIME = 2.0        # Revisión rápida
-MIN_PHASE_TIME = 8.0    # Bloqueo de 8s
-MAX_STEPS = 3600        # 1 hora simulada
-
-# --- UMBRALES DE TERMINACIÓN ---
-WARMUP_STEPS = 60       # Primeros 2 min (60 steps) no cortamos nada
-MIN_VEHICLES = 10       # Si hay menos de 10 autos, reiniciamos
-
-def parse_topology(net_file: Path):
-    tree = ET.parse(str(net_file))
-    root = tree.getroot()
-    junctions = {}
-    edges_map = {}
-    for j in root.findall("junction"):
-        jid = j.get("id")
-        inc = list({l.split("_")[0] for l in j.get("incLanes","").split() if not l.startswith(":")})
-        junctions[jid] = {"incoming": inc, "outgoing": []}
-    for e in root.findall("edge"):
-        eid = e.get("id")
-        if eid.startswith(":"): continue 
-        fr = e.get("from"); to = e.get("to")
-        edges_map[eid] = {"from":fr, "to":to}
-        if fr in junctions: junctions[fr]["outgoing"].append(eid)
-    return junctions, edges_map
+DELTA_TIME = 5.0        
+MIN_PHASE_TIME = 10.0   
+YELLOW_TIME = 3.0       
+MAX_WAIT_TIME = 20.0    
 
 class TrafficSumoEnv(gym.Env):
-    metadata = {"render_modes": ["human"]}
-
     def __init__(self, gui=False):
-        super().__init__()
+        super(TrafficSumoEnv, self).__init__()
         self.gui = gui
-        self.junctions, self.edges_map = parse_topology(NETWORK_FILE)
+        
+        # 1. Configurar SUMO
+        if 'SUMO_HOME' in os.environ:
+            tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
+            sys.path.append(tools)
+        else:
+            sys.exit("❌ Error: Por favor, declara la variable de entorno 'SUMO_HOME'")
+        
+        self._sumo_binary = sumolib.checkBinary('sumo-gui') if self.gui else sumolib.checkBinary('sumo')
+        self.config_file = "simulation.sumocfg"
+        self.net_file = "network.net.xml" 
+
+        # 2. ANÁLISIS DEL MAPA (Versión Tolerante 🛡️)
+        print("🔍 Analizando semáforos en el mapa...")
+        net = sumolib.net.readNet(self.net_file)
         
         self.tls_ids = []
-        self.tls_to_j = {}
-        self.tls_nph = {} 
-        self.last_change_time = {} 
-        self.last_actions = {}     
+        self.green_phases_map = {} 
+        self.action_dims = []      
 
-        self.action_space = None
-        self.observation_space = None
+        all_tls = net.getTrafficLights()
+        
+        for tls in all_tls:
+            tls_id = tls.getID()
+            programs = tls.getPrograms()
+            
+            green_indices = []
+
+            # CASO 1: Semáforo con lógica legible
+            if programs:
+                # Intentamos leer el programa '0' o el primero disponible
+                if '0' in programs: prog = programs['0']
+                else: prog = next(iter(programs.values()))
+                
+                phases = prog.getPhases()
+                for i, p in enumerate(phases):
+                    state = p.state
+                    if ('G' in state or 'g' in state) and 'y' not in state:
+                         green_indices.append(i)
+            
+            # CASO 2: Semáforo "Vacío" o sin fases verdes claras (El error que tenías)
+            # Estrategia: Asumimos por defecto fases 0 y 2 (Norte-Sur / Este-Oeste estándar)
+            if len(green_indices) == 0:
+                print(f"   ⚠️ ID: {tls_id} sin lógica clara. Aplicando configuración por defecto [0, 2].")
+                green_indices = [0, 2] # Asumimos 2 fases básicas
+
+            # Agregamos el semáforo a la lista de controlables
+            self.tls_ids.append(tls_id)
+            self.green_phases_map[tls_id] = green_indices
+            self.action_dims.append(len(green_indices)) 
+
+        num_tls = len(self.tls_ids)
+        print(f"✅ Total semáforos controlados: {num_tls}")
+        
+        if num_tls == 0:
+            raise ValueError("❌ No se encontraron semáforos. Revisa que network.net.xml tenga Traffic Lights (<tlLogic>).")
+
+        # 3. Definir Espacios
+        self.action_space = spaces.MultiDiscrete(self.action_dims)
+
+        obs_per_tls = 5 
+        total_obs_size = num_tls * obs_per_tls
+        
+        self.observation_space = spaces.Box(
+            low=0, 
+            high=999, 
+            shape=(total_obs_size,), 
+            dtype=np.float32
+        )
+
         self.step_count = 0
-        self.sumo_steps_per_rl_step = int(DELTA_TIME / STEP_LENGTH)
+        self.last_switch_time = {tls: 0 for tls in self.tls_ids}
+        self.connection = None
 
     def setup(self):
-        binpath = "sumo-gui" if self.gui else "sumo"
-        label = f"init_{random.randint(0,99999)}"
-        try:
-            traci.start([binpath, "-c", SUMO_CFG, "--start", "--quit-on-end"], label=label)
-            conn = traci.getConnection(label)
-        except traci.exceptions.FatalTraCIError:
-            conn = traci
+        try: traci.close()
+        except: pass
 
-        raw_tls = conn.trafficlight.getIDList()
-        mapped = {}
-        for t in raw_tls:
-            lanes = conn.trafficlight.getControlledLanes(t)
-            tgt = None
-            for lane in lanes:
-                e = lane.split("_")[0]
-                if e in self.edges_map:
-                    tgt = self.edges_map[e]["to"]
-                    if tgt in self.junctions: break
-            if tgt is None: tgt = next(iter(self.junctions)) 
-            mapped[t] = tgt
-
-        self.tls_ids = list(mapped.keys())
-        self.tls_to_j = mapped
-
-        for t in self.tls_ids:
-            try:
-                logic = conn.trafficlight.getCompleteRedYellowGreenDefinition(t)[0]
-                self.tls_nph[t] = len(logic.phases)
-                self.last_change_time[t] = 0.0
-                self.last_actions[t] = 0
-            except:
-                self.tls_nph[t] = 4 
-
-        if len(self.tls_ids) > 0:
-            self.action_space = spaces.MultiDiscrete([self.tls_nph[t] for t in self.tls_ids])
-            self.observation_space = spaces.Box(
-                low=-np.inf, high=np.inf, shape=(len(self.tls_ids)*2,), dtype=np.float32
-            )
-        else:
-            self.action_space = spaces.Discrete(1)
-            self.observation_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
-        conn.close()
-
-    def _get_obs(self):
-        obs = []
-        for t in self.tls_ids:
-            j = self.tls_to_j[t]
-            inc = self.junctions[j]["incoming"]
-            q_total = 0; w_total = 0
-            for e in inc:
-                try:
-                    q_total += traci.edge.getLastStepHaltingNumber(e)
-                    w_total += traci.edge.getWaitingTime(e)
-                except: pass
-            obs.append(q_total)
-            obs.append(w_total / 60.0) 
-        return np.array(obs, dtype=np.float32)
-
-    def _compute_reward(self):
-        total_queue = 0; total_waiting = 0
-        for t in self.tls_ids:
-            j = self.tls_to_j[t]
-            inc = self.junctions[j]["incoming"]
-            for e in inc:
-                try:
-                    total_queue += traci.edge.getLastStepHaltingNumber(e)
-                    total_waiting += traci.edge.getWaitingTime(e)
-                except: pass
-        return float(-1.0 * total_queue - 0.05 * total_waiting)
+        cmd = [self._sumo_binary, "-c", self.config_file, "--start"]
+        traci.start(cmd)
+        self.connection = traci
+        
+        for tls in self.tls_ids:
+            self.last_switch_time[tls] = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
-        # Generamos tráfico nuevo SIEMPRE para garantizar variedad
-        try:
-            # end_time debe ser al menos igual a MAX_STEPS (segundos reales)
-            generate_routefile(str(NETWORK_FILE), ROUTES_FILE, end_time=MAX_STEPS + 500)
-        except Exception as e:
-            print(f"⚠️ Error generando tráfico: {e}")
-
-        try: traci.close()
-        except: pass
-        time.sleep(0.5)
-
-        binpath = "sumo-gui" if self.gui else "sumo"
-        traci.start([binpath, "-c", SUMO_CFG, "--start", "--quit-on-end"])
-
+        self.setup()
         self.step_count = 0
-        for t in self.tls_ids:
-            self.last_change_time[t] = 0.0
-            self.last_actions[t] = 0
+        return self._get_observation(), {}
 
-        # Warm-up pequeño de simulación
-        for _ in range(5): traci.simulationStep()
-        return self._get_obs(), {}
+    def step(self, actions):
+        self.step_count += 1
+        current_time = traci.simulation.getTime()
+        
+        tls_to_switch = []
+        
+        # --- MAPEO INTELIGENTE ---
+        for i, tls_id in enumerate(self.tls_ids):
+            action_index = actions[i]
+            valid_phases = self.green_phases_map[tls_id]
+            
+            # Protección de rango
+            if action_index < len(valid_phases):
+                target_sumo_phase = valid_phases[action_index]
+            else:
+                target_sumo_phase = valid_phases[0]
 
-    def step(self, action):
-        current_sim_time = self.step_count * DELTA_TIME
-
-        # 1. Lógica Smart Locking
-        for i, t in enumerate(self.tls_ids):
             try:
-                proposed = int(action[i])
-                current = traci.trafficlight.getPhase(t)
-                time_since = current_sim_time - self.last_change_time[t]
+                current_phase = traci.trafficlight.getPhase(tls_id)
+                if current_phase != target_sumo_phase:
+                    if (current_time - self.last_switch_time[tls_id]) >= MIN_PHASE_TIME:
+                        tls_to_switch.append((tls_id, target_sumo_phase))
+            except Exception as e:
+                pass
 
-                if proposed != current:
-                    if time_since >= MIN_PHASE_TIME:
-                        traci.trafficlight.setPhase(t, proposed)
-                        self.last_change_time[t] = current_sim_time
+        # Ejecutar cambios (Auto-Yellow)
+        if len(tls_to_switch) > 0:
+            for tls_id, _ in tls_to_switch:
+                try:
+                    curr = traci.trafficlight.getPhase(tls_id)
+                    traci.trafficlight.setPhase(tls_id, curr + 1)
+                except: pass
+            
+            steps_yellow = int(YELLOW_TIME)
+            for _ in range(steps_yellow):
+                traci.simulationStep()
+            
+            for tls_id, target in tls_to_switch:
+                try:
+                    traci.trafficlight.setPhase(tls_id, target)
+                    self.last_switch_time[tls_id] = traci.simulation.getTime()
+                except: pass
+
+        steps_to_do = int(DELTA_TIME)
+        for _ in range(steps_to_do):
+            traci.simulationStep()
+
+        # Datos
+        observation = self._get_observation()
+        reward = self._calculate_global_reward()
+        
+        total_vehicles = traci.vehicle.getIDCount()
+        terminated = (total_vehicles == 0 and self.step_count > 50)
+        truncated = self.step_count > 2000
+        
+        return observation, reward, terminated, truncated, {"vehicles": total_vehicles}
+
+    def _get_observation(self):
+        full_obs = []
+        for tls_id in self.tls_ids:
+            try:
+                lanes = traci.trafficlight.getControlledLanes(tls_id)
+                halt_counts = [traci.lane.getLastStepHaltingNumber(lane) for lane in lanes]
+            except:
+                halt_counts = []
+
+            while len(halt_counts) < 4: halt_counts.append(0)
+            local_obs = halt_counts[:4]
+            
+            try: phase = traci.trafficlight.getPhase(tls_id)
+            except: phase = 0
+            local_obs.append(phase)
+            full_obs.extend(local_obs)
+            
+        return np.array(full_obs, dtype=np.float32)
+
+    def _calculate_global_reward(self):
+        total_halt = 0
+        penalty_wait = 0
+        
+        for tls_id in self.tls_ids:
+            try:
+                lanes = traci.trafficlight.getControlledLanes(tls_id)
+                for lane in lanes:
+                    total_halt += traci.lane.getLastStepHaltingNumber(lane)
+                    wait_time = traci.lane.getWaitingTime(lane)
+                    if wait_time > MAX_WAIT_TIME:
+                        penalty_wait += (wait_time - MAX_WAIT_TIME) * 1.5
             except: pass
 
-        # 2. Avanzar Simulación
-        for _ in range(self.sumo_steps_per_rl_step):
-            traci.simulationStep()
-            if self.gui: time.sleep(0.01) 
-        
-        self.step_count += 1
-        
-        # 3. Verificación de Densidad y Término
-        terminated = (self.step_count * DELTA_TIME) >= MAX_STEPS
-        
-        # --- REGLA DE ORO: MÍNIMO 10 AUTOS ---
-        vehicles_on_road = traci.vehicle.getIDCount()
-        
-        # Solo aplicamos la regla después del calentamiento (WARMUP_STEPS)
-        # para dar tiempo a que los autos entren al mapa.
-        if self.step_count > WARMUP_STEPS:
-            if vehicles_on_road < MIN_VEHICLES:
-                # Terminamos prematuramente porque no hay suficiente tráfico
-                terminated = True
-        
-        if terminated: self.close()
-        
-        # Pasamos info extra para que el log sepa por qué terminó o cuántos autos había
-        info = {"step": self.step_count, "vehs": vehicles_on_road}
-        
-        return self._get_obs(), self._compute_reward(), terminated, False, info
+        return - (total_halt * 0.5) - (penalty_wait * 1.0)
 
     def close(self):
         try: traci.close()
